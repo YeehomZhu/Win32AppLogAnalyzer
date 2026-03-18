@@ -300,6 +300,7 @@ function Parse-PolicyJSON {
             EnforcementStates  = @()
             LatestEnforcementState = $null
             EspPhase           = $null
+            StuckPhase         = $null
             Errors             = @()
             EventTimeline      = @()
             CheckinSession     = $null
@@ -577,6 +578,23 @@ function Get-AppEvents {
         # Sort timeline
         $app.EventTimeline = $timeline | Sort-Object Time
         $app.Errors = $errors
+
+        # --- Stuck Detection ---
+        # Determine if app is stuck at a particular phase
+        if ($app.DetectionState -ne 'Detected' -and -not $app.InstallResult) {
+            if ($app.InstallStartTime -and -not $app.InstallCompleteTime) {
+                $app.StuckPhase = 'Install'
+            }
+            elseif ($app.DownloadTimestamp -and -not $app.DownloadStatus) {
+                $app.StuckPhase = 'Download'
+            }
+            elseif ($app.DownloadStatus -and $app.DownloadStatus -ne 'Success' -and $app.DownloadStatus -ne 'Completed') {
+                $app.StuckPhase = 'Download'
+            }
+            elseif ($app.LatestEnforcementState -match 'InProgress') {
+                $app.StuckPhase = 'Processing'
+            }
+        }
     }
 }
 
@@ -864,6 +882,7 @@ body {
 .badge-success { background: #E8F5E9; color: var(--success); }
 .badge-failed { background: #FDE7E9; color: var(--error); }
 .badge-pending { background: #FFF8E1; color: #F57F17; }
+.badge-stuck { background: #FFE0B2; color: #E65100; font-weight: 600; }
 .badge-noactivity { background: #F3F2F1; color: #8A8886; }
 
 .status-icon { font-size: 18px; text-align: center; }
@@ -1162,7 +1181,8 @@ function Generate-HtmlReport {
     # Summary counts
     $installedCount = @($apps | Where-Object { $_.DetectionState -eq 'Detected' -and ($_.InstallResult -eq 'Success' -or $_.DetectionStatus -eq 'Success') }).Count
     $failedCount = @($apps | Where-Object { @($_.Errors).Count -gt 0 -or $_.InstallResult -eq 'Failed' -or $_.LatestEnforcementState -match 'Error' }).Count
-    $pendingCount = @($apps | Where-Object { $_.LatestEnforcementState -match 'InProgress' }).Count
+    $stuckCount = @($apps | Where-Object { $_.StuckPhase }).Count
+    $pendingCount = @($apps | Where-Object { $_.LatestEnforcementState -match 'InProgress' -and -not $_.StuckPhase }).Count
     $availableNotInstalled = @($apps | Where-Object { $_.IntentName -eq 'Available' -and $_.DetectionState -ne 'Detected' }).Count
     $lastEsp = if (@($EspPhaseEvents).Count -gt 0) { ($EspPhaseEvents | Select-Object -Last 1).Phase } else { 'N/A' }
 
@@ -1223,9 +1243,13 @@ $css
         <div class="card-value">$failedCount</div>
         <div class="card-label">Failed</div>
     </div>
+    <div class="card" style="border-left-color:#E65100">
+        <div class="card-value" style="color:#E65100">$stuckCount</div>
+        <div class="card-label">Stuck</div>
+    </div>
     <div class="card warning">
         <div class="card-value">$pendingCount</div>
-        <div class="card-label">Pending / In Progress</div>
+        <div class="card-label">In Progress</div>
     </div>
     <div class="card neutral">
         <div class="card-value">$availableNotInstalled</div>
@@ -1244,7 +1268,8 @@ $css
         <option value="all">All Status</option>
         <option value="installed">Installed</option>
         <option value="failed">Failed</option>
-        <option value="pending">Pending</option>
+        <option value="stuck">Stuck</option>
+        <option value="pending">In Progress</option>
         <option value="available">Available</option>
         <option value="noactivity">No Activity</option>
     </select>
@@ -1295,6 +1320,10 @@ $css
             $statusIcon = '&#10060;'  # red X
             $statusCss = 'failed'
         }
+        elseif ($app.StuckPhase) {
+            $statusIcon = '&#9888;'  # warning sign
+            $statusCss = 'stuck'
+        }
         elseif ($app.LatestEnforcementState -match 'InProgress' -or $app.DownloadStatus -eq 'PendingDownload') {
             $statusIcon = '&#9203;'  # hourglass
             $statusCss = 'pending'
@@ -1334,7 +1363,10 @@ $css
 
         # Install result
         $installResultDisplay = ''
-        if ($app.InstallResult) {
+        if ($app.StuckPhase) {
+            $installResultDisplay = "<span class=`"badge badge-stuck`">Stuck at $($app.StuckPhase)</span>"
+        }
+        elseif ($app.InstallResult) {
             $resultBadgeClass = switch ($app.InstallResult) {
                 'Success' { 'badge-success' }
                 'Failed' { 'badge-failed' }
