@@ -1,0 +1,22 @@
+# Output reports
+*.html
+
+# Log files (may contain PII/device data)
+*.log
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# PowerShell
+*.ps1xml
+
+# Test data / sample logs
+testdata/
+samples/
