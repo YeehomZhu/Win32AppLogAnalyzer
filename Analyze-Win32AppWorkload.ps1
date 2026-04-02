@@ -207,9 +207,26 @@ function Merge-LogFiles {
         $content = Get-Content -Path $f -Raw -ErrorAction SilentlyContinue
         if ($content) {
             $lines = $content -split "`r?`n"
+            # Join multi-line CMTrace LOG entries into single lines so the parser
+            # can capture them (e.g. WinGet operation result blocks).
+            $buffer = ""
             foreach ($l in $lines) {
-                if ($l.Trim()) { $allLines.Add($l) }
+                if (-not $l.Trim()) { continue }
+                if ($l -match '^<!\[LOG\[') {
+                    # Discard any previously unclosed buffer (malformed entry)
+                    $buffer = $l
+                } elseif ($buffer) {
+                    # Continuation line – append with a space
+                    $buffer += " " + $l.Trim()
+                }
+                # else: orphan continuation with no open buffer – skip
+                if ($buffer -and $buffer -match '\]LOG\]!>') {
+                    $allLines.Add($buffer)
+                    $buffer = ""
+                }
             }
+            # Flush any unclosed buffer at end of file
+            if ($buffer) { $allLines.Add($buffer) }
         }
     }
 
@@ -223,7 +240,9 @@ function Merge-LogFiles {
 function Parse-PolicyJSON {
     <#
     .SYNOPSIS
-        Extract the latest "Get policies" JSON and build an app inventory.
+        Extract app inventory from ALL "Get policies" entries in the log.
+        Apps are merged across all sessions; a later entry for the same AppId
+        overrides an earlier one (gives the most-recent metadata).
     #>
     param(
         [Parameter(Mandatory)]
@@ -237,36 +256,51 @@ function Parse-PolicyJSON {
         return @{}
     }
 
-    # Take the LAST occurrence that has actual app data (non-empty JSON array)
-    # Some check-in sessions may return "Get policies = []" (empty)
-    $lastPolicy = $null
-    $apps = $null
-    for ($i = $policyEntries.Count - 1; $i -ge 0; $i--) {
-        $candidate = $policyEntries[$i]
+    # Collect all unique apps from every non-empty policy entry.
+    # Later entries for the same AppId overwrite earlier ones (most recent wins).
+    $mergedAppsById = [ordered]@{}
+    $latestPolicyTime = $null
+
+    foreach ($candidate in $policyEntries) {
         $candidateJson = $candidate.Message -replace '^Get policies = ', ''
-        if ($candidateJson -and $candidateJson -ne '[]') {
-            try {
-                $parsedApps = $candidateJson | ConvertFrom-Json
-                if ($parsedApps -and @($parsedApps).Count -gt 0) {
-                    $lastPolicy = $candidate
-                    $apps = $parsedApps
-                    break
+        if (-not $candidateJson -or $candidateJson -eq '[]') { continue }
+        try {
+            $parsedApps = $candidateJson | ConvertFrom-Json
+            if ($parsedApps -and @($parsedApps).Count -gt 0) {
+                foreach ($pa in $parsedApps) {
+                    $mergedAppsById[$pa.Id] = $pa
                 }
+                $latestPolicyTime = $candidate.DateTime
             }
-            catch { continue }
         }
+        catch { continue }
     }
 
-    if (-not $apps) {
+    if ($mergedAppsById.Count -eq 0) {
         Write-Warning "All 'Get policies' entries contain empty app lists."
         return @{}
     }
 
-    Write-Host "  Using policy entry with $(@($apps).Count) app(s) from $($lastPolicy.DateTime)" -ForegroundColor Gray
+    $apps = @($mergedAppsById.Values)
+    Write-Host "  Using policy entry with $(@($apps).Count) app(s) from $latestPolicyTime" -ForegroundColor Gray
 
     $inventory = [ordered]@{}
     foreach ($app in $apps) {
         $appId = $app.Id
+
+        # Detect WinGet/Store apps via InstallerData field (no InstallCommandLine)
+        $appType         = 'Win32'
+        $winGetPackageId = $null
+        $winGetSource    = $null
+        if ($app.InstallerData) {
+            try {
+                $instData = $app.InstallerData | ConvertFrom-Json
+                $winGetPackageId = $instData.PackageIdentifier
+                $winGetSource    = $instData.SourceName
+                $appType         = 'WinGet'
+            } catch {}
+        }
+
         $inventory[$appId] = [PSCustomObject]@{
             AppId              = $appId
             Name               = $app.Name
@@ -286,6 +320,12 @@ function Parse-PolicyJSON {
             DOPriority         = $app.DOPriority
             Dependencies       = $app.FlatDependencies
             Version            = $app.Version
+            # WinGet/Store specific fields
+            AppType                = $appType
+            WinGetPackageId        = $winGetPackageId
+            WinGetSource           = $winGetSource
+            WinGetOperationResult  = $null
+            WinGetInstalledVersion = $null
             # Event tracking - populated later
             DetectionState     = $null
             DetectionStatus    = $null
@@ -529,6 +569,93 @@ function Get-AppEvents {
             $lastInstComplete = $installCompleteEntries | Select-Object -Last 1
             $app.InstallCompleteTime = $lastInstComplete.DateTime
             $timeline.Add([PSCustomObject]@{ Time = $lastInstComplete.DateTime; Event = 'Install Complete'; Detail = $lastInstComplete.Message; Type = $lastInstComplete.Type })
+        }
+
+        # --- WinGet: Execution Result (multi-line block) ---
+        $wingetExecEntries = $appEntries | Where-Object {
+            $_.Message -match '\[WinGetApp\]\[WinGetAppExecutionExecutor\].*Completed execution for app with id:'
+        }
+        if ($wingetExecEntries) {
+            $lastWge = $wingetExecEntries | Select-Object -Last 1
+            if ($lastWge.Message -match 'Operation result\s*=\s*(\S+)') {
+                $app.WinGetOperationResult = $Matches[1]
+            }
+            if ($lastWge.Message -match 'Installed version\s*=\s*(\S+)') {
+                $app.WinGetInstalledVersion = $Matches[1]
+            }
+            if (-not $app.InstallResult) {
+                if ($lastWge.Message -match 'Action status:\s*(\w+)') {
+                    $app.InstallResult = $Matches[1]
+                } elseif ($app.WinGetOperationResult -eq 'Ok') {
+                    $app.InstallResult = 'Success'
+                } elseif ($app.WinGetOperationResult) {
+                    $app.InstallResult = $app.WinGetOperationResult
+                }
+            }
+            foreach ($wge in $wingetExecEntries) {
+                $timeline.Add([PSCustomObject]@{ Time = $wge.DateTime; Event = 'WinGet Install'; Detail = $wge.Message; Type = $wge.Type })
+            }
+        }
+
+        # --- WinGet: Detection Result (multi-line block) ---
+        $wingetDetEntries = $appEntries | Where-Object {
+            $_.Message -match '\[WinGetApp\]\[WinGetAppDetectionExecutor\].*Completed detection for app with id:'
+        }
+        if ($wingetDetEntries) {
+            $lastWgd = $wingetDetEntries | Select-Object -Last 1
+            if (-not $app.DetectionState -and $lastWgd.Message -match 'Detection state:\s*(\S+)') {
+                $app.DetectionState = $Matches[1]
+            }
+            # Scan all detection entries for an installed version (the last NotDetected may have empty version)
+            foreach ($wgd in $wingetDetEntries) {
+                if (-not $app.WinGetInstalledVersion -and $wgd.Message -match 'Detected version:\s*(\S+)') {
+                    $app.WinGetInstalledVersion = $Matches[1]
+                }
+                $timeline.Add([PSCustomObject]@{ Time = $wgd.DateTime; Event = 'WinGet Detection'; Detail = $wgd.Message; Type = $wgd.Type })
+            }
+        }
+
+        # --- WinGet: Detection state fallback from single-line result ---
+        if (-not $app.DetectionState) {
+            $wingetDetResultEntries = $appEntries | Where-Object {
+                $_.Message -match '\[WinGet\] Detection Operation Result has arrived'
+            }
+            if ($wingetDetResultEntries) {
+                $lastWgdr = $wingetDetResultEntries | Select-Object -Last 1
+                if ($lastWgdr.Message -match 'has arrived\s+(\S+)') {
+                    $app.DetectionState = $Matches[1]
+                }
+            }
+        }
+
+        # --- WinGet: Applicability Result ---
+        $wingetAppliEntries = $appEntries | Where-Object {
+            $_.Message -match '\[WinGetApp\]\[WinGetAppApplicabilityExecutor\].*Completed applicability'
+        }
+        if ($wingetAppliEntries) {
+            $lastWga = $wingetAppliEntries | Select-Object -Last 1
+            if (-not $app.ApplicabilityState -and $lastWga.Message -match 'Applicability state:\s*(\S+)') {
+                $app.ApplicabilityState = $Matches[1]
+            }
+            foreach ($wga in $wingetAppliEntries) {
+                $timeline.Add([PSCustomObject]@{ Time = $wga.DateTime; Event = 'WinGet Applicability'; Detail = $wga.Message; Type = $wga.Type })
+            }
+        }
+
+        # --- WinGet: Download Progress ---
+        $wingetDlEntries = $appEntries | Where-Object {
+            $_.Message -match '\[StatusService\] Downloading app.*via WinGet'
+        }
+        if ($wingetDlEntries) {
+            if (-not $app.DownloadTimestamp) {
+                $app.DownloadTimestamp = ($wingetDlEntries | Select-Object -First 1).DateTime
+            }
+            $lastWgdl = $wingetDlEntries | Select-Object -Last 1
+            if ($lastWgdl.Message -match 'bytes (\d+)\/(\d+)') {
+                $dlBytes = $Matches[1]; $totalBytes = $Matches[2]
+                $app.DownloadStatus = if ($dlBytes -eq $totalBytes) { 'Completed' } else { "InProgress ($dlBytes/$totalBytes)" }
+                $timeline.Add([PSCustomObject]@{ Time = $lastWgdl.DateTime; Event = 'WinGet Download'; Detail = "Download progress: $dlBytes / $totalBytes bytes"; Type = $lastWgdl.Type })
+            }
         }
 
         # --- Post-Install Detection ---
@@ -884,6 +1011,8 @@ body {
 .badge-pending { background: #FFF8E1; color: #F57F17; }
 .badge-stuck { background: #FFE0B2; color: #E65100; font-weight: 600; }
 .badge-noactivity { background: #F3F2F1; color: #8A8886; }
+.badge-winget { background: #EDE7F6; color: #6A1B9A; }
+.badge-win32 { background: #E8F5E9; color: #2E7D32; }
 
 .status-icon { font-size: 18px; text-align: center; }
 
@@ -1295,14 +1424,15 @@ $css
         <tr>
             <th onclick="sortTable(0)">Status<span class="sort-icon"></span></th>
             <th onclick="sortTable(1)">App Name<span class="sort-icon"></span></th>
-            <th onclick="sortTable(2)">Intent<span class="sort-icon"></span></th>
-            <th onclick="sortTable(3)">Target<span class="sort-icon"></span></th>
-            <th onclick="sortTable(4)">Install Ctx<span class="sort-icon"></span></th>
-            <th onclick="sortTable(5)">Detection<span class="sort-icon"></span></th>
-            <th onclick="sortTable(6)">Install Result<span class="sort-icon"></span></th>
-            <th onclick="sortTable(7)">Install Time<span class="sort-icon"></span></th>
-            <th onclick="sortTable(8)">ESP Phase<span class="sort-icon"></span></th>
-            <th onclick="sortTable(9)">Enforcement<span class="sort-icon"></span></th>
+            <th onclick="sortTable(2)">Type<span class="sort-icon"></span></th>
+            <th onclick="sortTable(3)">Intent<span class="sort-icon"></span></th>
+            <th onclick="sortTable(4)">Target<span class="sort-icon"></span></th>
+            <th onclick="sortTable(5)">Install Ctx<span class="sort-icon"></span></th>
+            <th onclick="sortTable(6)">Detection<span class="sort-icon"></span></th>
+            <th onclick="sortTable(7)">Install Result<span class="sort-icon"></span></th>
+            <th onclick="sortTable(8)">Install Time<span class="sort-icon"></span></th>
+            <th onclick="sortTable(9)">ESP Phase<span class="sort-icon"></span></th>
+            <th onclick="sortTable(10)">Enforcement<span class="sort-icon"></span></th>
         </tr>
     </thead>
     <tbody>
@@ -1401,10 +1531,18 @@ $css
         $safeAppId = [System.Web.HttpUtility]::HtmlAttributeEncode($app.AppId)
         $safeName = [System.Web.HttpUtility]::HtmlEncode($app.Name)
 
+        # App type badge
+        $appTypeBadge = if ($app.AppType -eq 'WinGet') {
+            '<span class="badge badge-winget">WinGet</span>'
+        } else {
+            '<span class="badge badge-win32">Win32</span>'
+        }
+
         $html += @"
     <tr class="app-row" data-appid="$safeAppId" data-name="$safeName" data-status="$statusCss" data-intent="$($app.IntentName)" onclick="toggleDetail('$safeAppId')">
         <td class="status-icon">$statusIcon</td>
         <td><strong>$safeName</strong></td>
+        <td>$appTypeBadge</td>
         <td>$intentBadge</td>
         <td>$targetBadge</td>
         <td>$ctxBadge</td>
@@ -1415,11 +1553,26 @@ $css
         <td>$enfStr</td>
     </tr>
     <tr class="detail-row" id="detail-$safeAppId">
-        <td colspan="10">
+        <td colspan="11">
             <div class="detail-content">
 "@
 
-        # Detail - Commands
+        # Detail - WinGet Info (only for WinGet/Store apps)
+        if ($app.AppType -eq 'WinGet') {
+            $wgSource = if ($app.WinGetSource) { [System.Web.HttpUtility]::HtmlEncode($app.WinGetSource) } else { 'N/A' }
+            $wgPkgId  = if ($app.WinGetPackageId) { [System.Web.HttpUtility]::HtmlEncode($app.WinGetPackageId) } else { 'N/A' }
+            $wgOpResult = if ($app.WinGetOperationResult) { [System.Web.HttpUtility]::HtmlEncode($app.WinGetOperationResult) } else { 'N/A' }
+            $wgVersion  = if ($app.WinGetInstalledVersion) { [System.Web.HttpUtility]::HtmlEncode($app.WinGetInstalledVersion) } else { 'N/A' }
+            $html += "            <h4>WinGet / Store App Info</h4>`n"
+            $html += "            <div class=`"info-grid`">`n"
+            $html += "                <div class=`"info-item`"><span class=`"label`">Package ID:</span><span class=`"value`"><strong>$wgPkgId</strong></span></div>`n"
+            $html += "                <div class=`"info-item`"><span class=`"label`">Source:</span><span class=`"value`">$wgSource</span></div>`n"
+            $html += "                <div class=`"info-item`"><span class=`"label`">Operation Result:</span><span class=`"value`">$wgOpResult</span></div>`n"
+            $html += "                <div class=`"info-item`"><span class=`"label`">Installed Version:</span><span class=`"value`">$wgVersion</span></div>`n"
+            $html += "            </div>`n"
+        }
+
+        # Detail - Commands (only meaningful for Win32 apps)
         $html += "            <h4>Install Command</h4>`n"
         $html += "            <div class=`"code-block`">$([System.Web.HttpUtility]::HtmlEncode($app.InstallCommandLine))</div>`n"
         $html += "            <h4>Uninstall Command</h4>`n"
