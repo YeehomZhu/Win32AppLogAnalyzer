@@ -2,17 +2,24 @@
 
 A PowerShell-based tool for analyzing Microsoft Intune Win32 app deployment logs (`AppWorkload.log`) and generating interactive HTML reports.
 
+Supports both traditional **Win32 apps** and **WinGet / Microsoft Store apps** deployed via Intune.
+
 ## Features
 
-- **CMTrace Log Parsing** — Parses standard SCCM/CMTrace format log entries
+- **CMTrace Log Parsing** — Parses standard SCCM/CMTrace format log entries, including multi-line WinGet result blocks
 - **Multi-File Merging** — Automatically merges rotated log files in chronological order
-- **App Inventory Extraction** — Extracts all assigned Win32 apps from the "Get policies" JSON
+- **Cross-Session App Inventory** — Merges apps from all "Get policies" entries across check-in sessions, so apps from different sessions are never missed
+- **WinGet / Microsoft Store App Support** — Automatically detects WinGet-type apps and extracts:
+  - Package ID and source repository (e.g. `msstore`, `winget`)
+  - WinGet operation result (`Ok`, `InstallError`, etc.)
+  - Installed / detected version
+  - Download progress, detection state, and applicability check results
 - **Per-App Event Tracking** — Tracks detection, applicability, download, install, and enforcement states for each app
 - **ESP Phase Detection** — Identifies Autopilot Enrollment Status Page phases
 - **Interactive HTML Report** — Generates a self-contained HTML report with:
   - Dashboard summary cards
-  - Sortable/filterable app table
-  - Expandable detail sections per app (commands, detection rules, timeline, errors)
+  - Sortable/filterable app table with **App Type** column (Win32 / WinGet)
+  - Expandable detail sections per app (WinGet package info, commands, detection rules, timeline, errors)
   - Error summary section (general errors, deduplicated)
   - CSV export capability
 
@@ -47,8 +54,11 @@ A PowerShell-based tool for analyzing Microsoft Intune Win32 app deployment logs
 ## Report Sections
 
 1. **Summary Dashboard** — Total apps, installed, failed, pending, available counts
-2. **App Deployment Table** — Status, name, intent, target, detection, install result, enforcement state
-3. **Expandable Details** — Install/uninstall commands, detection rules, install behavior, return codes, event timeline, error details
+2. **App Deployment Table** — Status, name, **app type (Win32 / WinGet)**, intent, target, detection, install result, enforcement state
+3. **Expandable Details**
+   - *Win32 apps:* Install/uninstall commands, detection rules, install behavior, return codes
+   - *WinGet apps:* Package ID, source repository, operation result, installed version
+   - Event timeline and error details for all app types
 4. **Error Summary** — General errors (non-app-specific), deduplicated
 5. **Check-in Sessions** — Detected check-in sessions with timestamps
 
@@ -70,6 +80,7 @@ This tool is provided as-is for troubleshooting purposes. It is not an official 
 ## References
 
 - [Win32 app deployment flow (Microsoft Learn)](https://learn.microsoft.com/en-us/troubleshoot/mem/intune/app-management/develop-deliver-working-win32-app-via-intune)
+- [WinGet app deployment via Intune (Microsoft Learn)](https://learn.microsoft.com/en-us/mem/intune/apps/store-apps-microsoft)
 - Intune Management Extension (SideCar) Agent Logs
 
 ## License
