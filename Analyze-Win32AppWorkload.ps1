@@ -1938,7 +1938,18 @@ if (-not (Test-Path $outputDir)) {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 }
 
-$htmlContent | Out-File -FilePath $OutputPath -Encoding UTF8 -Force
+# Write report - fall back to user Downloads folder if the target path is not writable
+try {
+    $htmlContent | Out-File -FilePath $OutputPath -Encoding UTF8 -Force -ErrorAction Stop
+}
+catch {
+    $fallbackDir = Join-Path $env:USERPROFILE 'Downloads'
+    if (-not (Test-Path $fallbackDir)) { $fallbackDir = $env:TEMP }
+    $fallbackPath = Join-Path $fallbackDir "Win32AppWorkload_Report.html"
+    Write-Warning "Cannot write to '$OutputPath' (access denied). Falling back to: $fallbackPath"
+    $htmlContent | Out-File -FilePath $fallbackPath -Encoding UTF8 -Force
+    $OutputPath = $fallbackPath
+}
 Write-Host ""
 Write-Host "Report generated successfully!" -ForegroundColor Green
 Write-Host "  Output: $OutputPath" -ForegroundColor Cyan
