@@ -1,6 +1,19 @@
 # Win32 AppWorkload Log Analyzer
 
-A PowerShell-based tool for analyzing Microsoft Intune Win32 app deployment logs (`AppWorkload.log`) and generating interactive HTML reports.
+A PowerShell-based toolkit for analyzing Microsoft Intune Management Extension (IME) logs and generating interactive HTML reports.
+
+This repo contains **two independent analyzers**:
+
+| Script | Log Source | Output |
+|--------|-----------|--------|
+| `Analyze-Win32AppWorkload.ps1` | `AppWorkload.log` | `Win32AppWorkload_Report.html` |
+| `Analyze-IMEPowerShell.ps1` | `IntuneManagementExtension.log`, `AgentExecutor.log`, `HealthScripts.log` | `IME_PowerShell_Report.html` |
+
+---
+
+## Analyze-Win32AppWorkload.ps1
+
+Analyzes Win32 and WinGet/Microsoft Store app deployments from `AppWorkload.log`.
 
 Supports both traditional **Win32 apps** and **WinGet / Microsoft Store apps** deployed via Intune.
 
@@ -61,6 +74,85 @@ Supports both traditional **Win32 apps** and **WinGet / Microsoft Store apps** d
    - Event timeline and error details for all app types
 4. **Error Summary** — General errors (non-app-specific), deduplicated
 5. **Check-in Sessions** — Detected check-in sessions with timestamps
+
+## Requirements
+
+- PowerShell 5.1+ or PowerShell 7+
+- No external modules required (fully self-contained)
+
+---
+
+## Analyze-IMEPowerShell.ps1
+
+Analyzes PowerShell script and Proactive Remediation / HealthScript execution from IME logs.
+
+### Features
+
+- **Multi-File Merging** — Automatically merges rotated log files (`IntuneManagementExtension*.log`, `AgentExecutor*.log`, `HealthScripts*.log`) in chronological order
+- **File-Lock Safe** — Reads live IME log files even while they are held open by the IME agent
+- **PowerShell Script Runs** — Tracks each `[PowerShell]` polling cycle and per-policy script execution: context, download count, running mode, signature check, exit code, stderr length, result
+- **Proactive Remediation / HealthScript Runs** — Tracks each HealthScript runner cycle with full detection → remediation → post-detection flow: pre-detect exit code, remediation triggered, post-detect result, output/error content
+- **Script Body Display** — Reads detection and remediation script content from the IME HealthScript cache on disk and shows it inline in the report (for same-device analysis)
+- **Deduplication** — Shows only the latest run per Policy ID, removing noise from repeated executions
+- [Proactive Remediation / HealthScripts (Microsoft Learn)](https://learn.microsoft.com/en-us/intune/intune-service/fundamentals/remediations)
+- **Cross-Correlation** — Matches AgentExecutor runs to PS script runs for complete exit code / stderr details
+- **Interactive HTML Report** — Self-contained report with dashboard cards, sortable/filterable tables, and expandable per-policy detail rows showing script body, outputs, and errors
+
+### Usage
+
+```powershell
+# Analyze from default IME log path (auto-discovers logs)
+.\Analyze-IMEPowerShell.ps1
+
+# Analyze from a specific folder and open in browser
+.\Analyze-IMEPowerShell.ps1 -LogFolder "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs" -ShowInBrowser
+
+# Analyze specific log files
+.\Analyze-IMEPowerShell.ps1 -LogFiles "C:\Logs\IntuneManagementExtension.log","C:\Logs\AgentExecutor.log","C:\Logs\HealthScripts.log"
+
+# Specify custom output path
+.\Analyze-IMEPowerShell.ps1 -LogFolder "C:\Logs" -OutputPath "C:\Reports\IME_Report.html"
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `-LogFiles` | string[] | No | One or more IME log file paths |
+| `-LogFolder` | string | No | Folder path to auto-discover all IME log files |
+| `-OutputPath` | string | No | HTML report output path (default: same folder as logs, fallback to Downloads) |
+| `-ShowInBrowser` | switch | No | Auto-open report in default browser |
+
+### Report Sections
+
+1. **Summary Dashboard** — Polling cycles, PS script runs (success/failed/max-retries), remediation runs (compliant/remediated/failed), log error count
+2. **PowerShell Script Runs Table** — Per-policy execution with context, mode, exit code, stderr length, result; expandable detail with **script body**, command line, stdout/stderr
+3. **Remediation / Proactive Remediation Table** — Per-policy run with schedule, pre-detect, remediation triggered, post-detect, result; expandable detail with **detection script body**, **remediation script body**, script outputs and errors
+4. **Error Summary** — All CMTrace type-3 entries grouped by message (deduplicated)
+5. **Polling Cycles** — IME PowerShell polling cycle timeline with script count per cycle
+
+### Script Body Display
+
+Proactive Remediation / HealthScript detection and remediation script bodies (`detect.ps1`, `remediate.ps1`) are stored by the IME agent in:
+
+```
+C:\Windows\IMECache\HealthScripts\{PolicyId}_{version}\detect.ps1
+C:\Windows\IMECache\HealthScripts\{PolicyId}_{version}\remediate.ps1
+```
+
+**These files are owned by SYSTEM with no ACL entries for admins or regular users.**
+
+- Script paths are always extracted from the log and shown in the report  
+- Script body content is only readable when the analyzer runs **as SYSTEM** (e.g. via `PsExec -s`)  
+- When running as a regular user or admin, the report shows the path with a note: *"Script body unavailable — IMECache files are SYSTEM-only"*
+
+To run as SYSTEM with [PsExec](https://learn.microsoft.com/en-us/sysinternals/downloads/psexec):
+
+```powershell
+PsExec.exe -s -i powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Path\To\Analyze-IMEPowerShell.ps1 -ShowInBrowser
+```
+
+---
 
 ## Requirements
 
